@@ -5,6 +5,8 @@ import Prelude
 import Control.Monad.Aff.AVar (AVar)
 import Control.Monad.Eff.Exception (Error)
 import Control.Monad.Free (Free, liftF)
+import Control.Transformers.Back.Trans (FailBack)
+import Control.Transformers.Back.Trans as B
 import Data.Either (Either, either)
 import Data.Exists (Exists, mkExists)
 import Data.Foreign.Class (class Decode, class Encode)
@@ -22,7 +24,8 @@ data Authorization = RegistrationTokens RegTokens
 type UIResult s = Either Error s
 type APIResult s = Either ErrorResponse s
 data Store = LocalStore | InMemoryStore
-newtype Control s = Control (AVar s)
+data FlowResult a = Result a | GoBack
+newtype Control s = Control (AVar (FlowResult s))
 
 data ErrorHandler s
   = ThrowError String
@@ -35,9 +38,11 @@ data FlowMethodF a s
   | CallAPI (Interaction (APIResult s)) (APIResult s -> a)
   | Get Store Key (Maybe String -> a)
   | Set Store Key String a
+  | SetBackPoint a
+  | StepBack (s -> a)
   | Fork (Flow s) (Control s -> a)
   | DoAff (forall eff. AppFlow eff s) (s -> a)
-  | Await (Control s) (s -> a)
+  | Await (Control s) (FlowResult s -> a)
   | Delay Milliseconds a
   | OneOf (Array (Flow s)) (s -> a)
   | HandleError (Flow (ErrorHandler s)) (s -> a)
@@ -54,6 +59,11 @@ type Flow a = Free FlowWrapper a
 wrap :: forall a s. FlowMethodF a s -> Flow a
 wrap = liftF <<< FlowWrapper <<< mkExists
 
+toFlowResult :: FailBack ~> FlowResult
+toFlowResult (B.GoBack) = GoBack
+toFlowResult (B.NoBack a) = Result a
+toFlowResult (B.BackPoint a) = Result a
+
 -- | Gets some string from state by key
 getS :: Key -> Flow (Maybe String)
 getS key = wrap $ Get InMemoryStore key id
@@ -69,6 +79,12 @@ loadS key = wrap $ Get LocalStore key id
 -- | Puts a string value into the localStorage using key.
 saveS :: Key -> String -> Flow Unit
 saveS key val = wrap $ Set LocalStore key val unit
+
+setBackPoint :: Flow Unit
+setBackPoint = wrap $ SetBackPoint unit
+
+goBack :: forall a. Flow a
+goBack = wrap $ StepBack id
 
 -- | Converts error to string and throws at runtime or returns result.
 withError :: forall err s. (err -> String) -> Flow (Either err s) -> Flow s
@@ -138,7 +154,7 @@ doAff :: forall s. (forall eff. AppFlow eff s) -> Flow s
 doAff aff = wrap $ DoAff aff id
 
 -- | Awaits result from a forked flow.
-await :: forall s. Control s -> Flow s
+await :: forall s. Control s -> Flow (FlowResult s)
 await control = wrap $ Await control id
 
 -- | Awaits a forked flow to be completed.

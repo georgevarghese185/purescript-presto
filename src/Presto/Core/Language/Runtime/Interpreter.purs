@@ -18,6 +18,7 @@ import Control.Monad.Free (foldFree)
 import Control.Monad.State.Trans as S
 import Control.Monad.Trans.Class (lift)
 import Control.Parallel (parOneOf)
+import Control.Transformers.Back.Trans (BackT(..), FailBack(..), runBackT)
 import Data.Either (Either(..))
 import Data.Exists (runExists)
 import Data.Foreign.JSON (parseJSON)
@@ -28,7 +29,7 @@ import Global.Unsafe (unsafeStringify)
 import Presto.Core.Language.Runtime.API (APIRunner, runAPIInteraction)
 import Presto.Core.LocalStorage (getValueFromLocalStore, setValueToLocalStore)
 import Presto.Core.Types.App (AppFlow, STORAGE, UI)
-import Presto.Core.Types.Language.Flow (ErrorHandler(..), Flow, FlowMethod, FlowMethodF(..), FlowWrapper(..), Store(..), Control(..))
+import Presto.Core.Types.Language.Flow (Control(..), ErrorHandler(..), Flow, FlowMethod, FlowMethodF(..), FlowWrapper(..), Store(..), toFlowResult)
 import Presto.Core.Types.Language.Interaction (InteractionF(..), Interaction, ForeignOut(..))
 import Presto.Core.Types.Language.Storage (Key)
 import Presto.Core.Types.Permission (Permission, PermissionResponse, PermissionStatus)
@@ -37,7 +38,7 @@ type AffError e = (Error -> Eff e Unit)
 type AffSuccess s e = (s -> Eff e Unit)
 
 type St = AVar (StrMap String)
-type InterpreterSt eff a = S.StateT St (AppFlow eff) a
+type InterpreterSt eff a = BackT (S.StateT St (AppFlow eff)) a
 
 type UIRunner = forall e. String -> Aff (ui :: UI | e) String
 
@@ -50,14 +51,14 @@ data Runtime = Runtime UIRunner PermissionRunner APIRunner
 -- FIXME: can the effects on the interepreter of each type be more fine-grained?
 
 readState :: forall eff. InterpreterSt eff (StrMap String)
-readState = S.get >>= (lift <<< readVar)
+readState = lift S.get >>= (lift <<< lift <<< readVar)
 
 updateState :: forall eff. Key -> String -> InterpreterSt eff Unit
 updateState key value = do
-  stVar <- S.get
-  st <- lift $ takeVar stVar
+  stVar <- lift S.get
+  st <- lift $ lift $ takeVar stVar
   let st' = insert key value st
-  lift $ putVar st' stVar
+  lift $ lift $ putVar st' stVar
 
 interpretUI :: forall eff. UIRunner -> NaturalTransformation InteractionF (AppFlow eff)
 interpretUI uiRunner (Request fgnIn nextF) = do
@@ -72,66 +73,78 @@ runUIInteraction uiRunner = foldFree (interpretUI uiRunner)
 -- TODO: canceller support
 forkFlow :: forall eff a. Runtime -> Flow a -> InterpreterSt eff (Control a)
 forkFlow rt flow = do
-  st <- S.get
-  resultVar <- lift makeEmptyVar
-  let m = S.evalStateT (run rt flow) st
-  _ <- lift $ forkAff $ m >>= flip putVar resultVar
+  st <- lift S.get
+  resultVar <- lift $ lift makeEmptyVar
+  let m = S.evalStateT (runBackT $ run rt flow) st
+  _ <- lift $ lift $ forkAff $ m >>= (toFlowResult >>> flip putVar resultVar)
   pure $ Control resultVar
 
 runErrorHandler :: forall eff s. ErrorHandler s -> InterpreterSt eff s
-runErrorHandler (ThrowError msg) = throwError $ error msg
+runErrorHandler (ThrowError msg) = lift $ throwError $ error msg
 runErrorHandler (ReturnResult res) = pure res
 
 interpret :: forall eff s. Runtime -> NaturalTransformation (FlowMethod s) (InterpreterSt eff)
 interpret (Runtime _ _ apiRunner) (CallAPI apiInteractionF nextF) = do
-  lift $ runAPIInteraction apiRunner apiInteractionF
+  lift $ lift $ runAPIInteraction apiRunner apiInteractionF
     >>= (pure <<< nextF)
 
 interpret (Runtime uiRunner _ _) (RunUI uiInteraction nextF) = do
-  lift $ runUIInteraction uiRunner uiInteraction
+  lift $ lift $ runUIInteraction uiRunner uiInteraction
     >>= (pure <<< nextF)
 
 interpret (Runtime uiRunner _ _) (ForkUI uiInteraction next) = do
-  void $ lift $ forkAff $ runUIInteraction uiRunner uiInteraction
+  void $ lift $ lift $ forkAff $ runUIInteraction uiRunner uiInteraction
   pure next
 
-interpret _ (Get LocalStore key next) = lift $ getValueFromLocalStore key >>= (pure <<< next)
+interpret _ (Get LocalStore key next) = lift $ lift $ getValueFromLocalStore key >>= (pure <<< next)
 
 interpret _ (Get InMemoryStore key next) = do
   readState >>= (lookup key >>> next >>> pure)
 
 interpret _ (Set LocalStore key value next) = do
-  lift $ setValueToLocalStore key value
+  lift $ lift $ setValueToLocalStore key value
   pure next
 
 interpret _ (Set InMemoryStore key value next) = do
   updateState key value *> pure next
 
+interpret _ (SetBackPoint next) = do
+  BackT $ BackPoint <$> pure unit
+  pure next
+
+interpret _ (StepBack nextF) = do
+  BackT (pure GoBack) >>= pure <<< nextF
+
 interpret r (Fork flow nextF) = forkFlow r flow >>= (pure <<< nextF)
 
-interpret _ (DoAff aff nextF) = lift aff >>= (pure <<< nextF)
+interpret _ (DoAff aff nextF) = lift $ lift aff >>= (pure <<< nextF)
 
 interpret _ (Await (Control resultVar) nextF) = do
-  lift (readVar resultVar) >>= (pure <<< nextF)
+  lift $ lift (readVar resultVar) >>= (pure <<< nextF)
 
-interpret _ (Delay duration next) = lift (delay duration) *> pure next
+interpret _ (Delay duration next) = lift $ lift (delay duration) *> pure next
 
 interpret rt (OneOf flows nextF) = do
-  st <- S.get
-  Tuple a s <- lift $ parOneOf (parFlow st <$> flows)
-  S.put s
-  pure $ nextF a
+  st <- lift S.get
+  Tuple a s <- lift $ lift $ parOneOf (parFlow st <$> flows)
+  case a of
+    NoBack a' -> return a' s
+    BackPoint a' -> return a' s
+    GoBack -> interpret rt (StepBack nextF)
   where
-    parFlow st flow = S.runStateT (run rt flow) st
+    parFlow st flow = S.runStateT (runBackT $ run rt flow) st
+    return a s = do
+      S.put s
+      pure $ nextF a
 
 interpret rt (HandleError flow nextF) =
   run rt flow >>= runErrorHandler >>= (pure <<< nextF)
 
 interpret (Runtime _ (PermissionRunner check _) _) (CheckPermissions permissions nextF) = do
-  lift $ check permissions >>= (pure <<< nextF)
+  lift $ lift $ check permissions >>= (pure <<< nextF)
 
 interpret (Runtime _ (PermissionRunner _ take) _) (TakePermissions permissions nextF) = do
-  lift $ take permissions >>= (pure <<< nextF)
+  lift $ lift $ take permissions >>= (pure <<< nextF)
 
 run :: forall eff. Runtime -> NaturalTransformation Flow (InterpreterSt eff)
 run runtime = foldFree (\(FlowWrapper x) -> runExists (interpret runtime) x)
